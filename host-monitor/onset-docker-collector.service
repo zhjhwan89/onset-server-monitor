@@ -1,0 +1,15 @@
+[Unit]
+Description=Onset Docker agent report collector
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/onset-host-monitor
+ExecStart=/usr/bin/python3 /opt/onset-host-monitor/docker_collector.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

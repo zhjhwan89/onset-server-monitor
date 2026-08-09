@@ -1,0 +1,17 @@
+.env
+*.env
+!*.env.example
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite*
+*.log
+*.tmp
+*.bak*
+status.json
+state.json
+docker-reports/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

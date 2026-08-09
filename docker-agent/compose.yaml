@@ -1,0 +1,9 @@
+services:
+  docker-agent:
+    build: .
+    container_name: onset-docker-agent
+    restart: unless-stopped
+    env_file:
+      - agent.env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro

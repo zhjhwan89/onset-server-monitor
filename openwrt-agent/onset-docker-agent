@@ -1,0 +1,25 @@
+#!/bin/sh
+
+. /etc/onset-docker-agent.env
+
+while true; do
+    if command -v docker >/dev/null 2>&1; then
+        available=true
+        lines="$(docker ps -a --format '{{json .}}' 2>/dev/null)"
+        if [ $? -eq 0 ]; then
+            containers="$(printf '%s\n' "$lines" | awk 'BEGIN{printf "["} NF{if(n++)printf ",";printf "%s",$0} END{print "]"}')"
+            error=null
+        else
+            containers='[]'
+            error='"docker command failed"'
+        fi
+    else
+        available=false
+        containers='[]'
+        error=null
+    fi
+    payload="$(printf '{\042vmid\042:%s,\042vm_name\042:\042%s\042,\042hostname\042:\042%s\042,\042updated_at\042:\042%s\042,\042docker_available\042:%s,\042error\042:%s,\042containers\042:%s}' "$VM_ID" "$VM_NAME" "$(hostname)" "$(date -Iseconds)" "$available" "$error" "$containers")"
+    printf '%s' "$payload" > /tmp/onset-docker-report.json
+    wget -q -O - -T 10 --header="Content-Type: application/json" --header="X-Agent-Token: $DOCKER_AGENT_SECRET" --post-file=/tmp/onset-docker-report.json "$COLLECTOR_URL/report" >/dev/null 2>&1
+    sleep "${CHECK_INTERVAL:-30}"
+done
