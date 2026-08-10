@@ -3,8 +3,10 @@ import base64
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import os
+import re
 import secrets
 import socket
 import sqlite3
@@ -47,6 +49,7 @@ FAILURE_THRESHOLD = max(1, int(os.getenv("FAILURE_THRESHOLD", "3")))
 PING_TIMEOUT = max(1, int(os.getenv("PING_TIMEOUT", "3")))
 TCP_TIMEOUT = max(1, int(os.getenv("TCP_TIMEOUT", "5")))
 TRAFFIC_CHECK_INTERVAL = max(60, int(os.getenv("TRAFFIC_CHECK_INTERVAL", "300")))
+METRICS_CHECK_INTERVAL = max(30, int(os.getenv("METRICS_CHECK_INTERVAL", "60")))
 SSH_TIMEOUT = max(3, int(os.getenv("SSH_TIMEOUT", "8")))
 SUI_CHECK_INTERVAL = max(60, int(os.getenv("SUI_CHECK_INTERVAL", "300")))
 SUI_TIMEOUT = max(5, int(os.getenv("SUI_TIMEOUT", "15")))
@@ -79,6 +82,7 @@ monitor_stop = threading.Event()
 monitor_thread = None
 check_lock = threading.Lock()
 traffic_check_lock = threading.Lock()
+metrics_check_lock = threading.Lock()
 sui_check_lock = threading.Lock()
 proxy_check_lock = threading.Lock()
 cf_check_lock = threading.Lock()
@@ -185,6 +189,10 @@ def init_db():
             "traffic_last_check": "TEXT",
             "traffic_error": "TEXT",
             "traffic_alert_level": "INTEGER NOT NULL DEFAULT 0",
+            "metrics_json": "TEXT",
+            "metrics_last_check": "TEXT",
+            "metrics_error": "TEXT",
+            "packet_loss_pct": "REAL",
             "sui_enabled": "INTEGER NOT NULL DEFAULT 0",
             "sui_url": "TEXT",
             "sui_token_encrypted": "TEXT",
@@ -387,16 +395,21 @@ def notification_send(message):
 
 
 def ping_check(host):
-    started = time.monotonic()
     result = subprocess.run(
-        ["ping", "-c", "1", "-W", str(PING_TIMEOUT), host],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=PING_TIMEOUT + 2,
+        ["ping", "-c", "3", "-W", str(PING_TIMEOUT), host],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env={**os.environ, "LC_ALL": "C"},
+        timeout=PING_TIMEOUT * 3 + 3,
         check=False,
     )
-    latency = round((time.monotonic() - started) * 1000, 1)
-    return result.returncode == 0, latency
+    output = result.stdout or ""
+    loss_match = re.search(r"([0-9.]+)% packet loss", output)
+    latency_match = re.search(r"=\s*[0-9.]+/([0-9.]+)/", output)
+    packet_loss = float(loss_match.group(1)) if loss_match else (0.0 if result.returncode == 0 else 100.0)
+    latency = round(float(latency_match.group(1)), 1) if latency_match else None
+    return result.returncode == 0, latency, packet_loss
 
 
 def tcp_check(host, port):
@@ -404,19 +417,19 @@ def tcp_check(host, port):
     try:
         with socket.create_connection((host, int(port)), timeout=TCP_TIMEOUT):
             latency = round((time.monotonic() - started) * 1000, 1)
-            return True, latency
+            return True, latency, 0.0
     except (OSError, ValueError):
-        return False, None
+        return False, None, 100.0
 
 
 def check_one(vps):
     try:
         if vps["check_type"] == "tcp":
-            ok, latency = tcp_check(vps["host"], vps["port"])
+            ok, latency, packet_loss = tcp_check(vps["host"], vps["port"])
         else:
-            ok, latency = ping_check(vps["host"])
+            ok, latency, packet_loss = ping_check(vps["host"])
     except (OSError, subprocess.SubprocessError):
-        ok, latency = False, None
+        ok, latency, packet_loss = False, None, 100.0
 
     previous = vps["status"]
     failures = 0 if ok else vps["consecutive_failures"] + 1
@@ -446,12 +459,13 @@ def check_one(vps):
         conn.execute(
             """
             UPDATE vps
-            SET status=?, latency_ms=?, last_check=?, consecutive_failures=?, outage_alerted=?
+            SET status=?, latency_ms=?, packet_loss_pct=?, last_check=?, consecutive_failures=?, outage_alerted=?
             WHERE id=?
             """,
             (
                 status,
                 latency if ok else None,
+                packet_loss,
                 now_local().isoformat(timespec="seconds"),
                 failures,
                 outage_alerted,
@@ -659,6 +673,201 @@ def run_traffic_checks():
                 list(pool.map(check_traffic_one, rows))
     finally:
         traffic_check_lock.release()
+
+
+def ssh_collect_metrics(vps, password, transport_proxy=None):
+    attempts = [transport_proxy, None] if transport_proxy else [None]
+    errors = []
+    command = r'''
+set -- $(head -n 1 /proc/stat); shift
+total1=0; for value in "$@"; do total1=$((total1 + value)); done
+idle1=$(($4 + $5))
+iface=$(ip route show default 2>/dev/null | awk 'NR==1{print $5}')
+[ -n "$iface" ] || iface=$(ip -6 route show default 2>/dev/null | awk 'NR==1{print $5}')
+rx1=0; tx1=0
+if [ -n "$iface" ] && [ -r "/sys/class/net/$iface/statistics/rx_bytes" ]; then
+  rx1=$(cat "/sys/class/net/$iface/statistics/rx_bytes")
+  tx1=$(cat "/sys/class/net/$iface/statistics/tx_bytes")
+fi
+sleep 1
+set -- $(head -n 1 /proc/stat); shift
+total2=0; for value in "$@"; do total2=$((total2 + value)); done
+idle2=$(($4 + $5))
+rx2=$rx1; tx2=$tx1
+if [ -n "$iface" ] && [ -r "/sys/class/net/$iface/statistics/rx_bytes" ]; then
+  rx2=$(cat "/sys/class/net/$iface/statistics/rx_bytes")
+  tx2=$(cat "/sys/class/net/$iface/statistics/tx_bytes")
+fi
+cpu_percent=$(awk -v t1="$total1" -v t2="$total2" -v i1="$idle1" -v i2="$idle2" 'BEGIN { d=t2-t1; if (d>0) printf "%.1f", (1-(i2-i1)/d)*100; else print "0.0" }')
+mem_total_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+mem_available_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+if [ -z "$mem_available_kb" ]; then
+  mem_available_kb=$(awk '/^MemFree:|^Buffers:|^Cached:/ {sum += $2} END {print sum}' /proc/meminfo)
+fi
+mem_used_kb=$((mem_total_kb - mem_available_kb))
+mem_percent=$(awk -v u="$mem_used_kb" -v t="$mem_total_kb" 'BEGIN { if (t>0) printf "%.1f", u/t*100; else print "0.0" }')
+swap_total_kb=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
+swap_free_kb=$(awk '/^SwapFree:/ {print $2}' /proc/meminfo)
+swap_used_kb=$((swap_total_kb - swap_free_kb))
+swap_percent=$(awk -v u="$swap_used_kb" -v t="$swap_total_kb" 'BEGIN { if (t>0) printf "%.1f", u/t*100; else print "0.0" }')
+set -- $(df -Pk / | awk 'NR==2 {gsub(/%/, "", $5); print $2, $3, $5}')
+disk_total_kb=${1:-0}; disk_used_kb=${2:-0}; disk_percent=${3:-0}
+uptime_seconds=$(awk '{printf "%.0f", $1}' /proc/uptime)
+os_name=$(awk -F= '/^PRETTY_NAME=/{gsub(/^"|"$/, "", $2); print $2; exit}' /etc/os-release 2>/dev/null | tr '\n' ' ')
+[ -n "$os_name" ] || os_name=$(uname -s)
+os_version=$(awk -F= '/^VERSION_ID=/{gsub(/^"|"$/, "", $2); print $2; exit}' /etc/os-release 2>/dev/null | tr '\n' ' ')
+public_ip=''
+if command -v curl >/dev/null 2>&1; then
+  public_ip=$(curl -4fsS --connect-timeout 3 --max-time 5 https://api.ipify.org 2>/dev/null || true)
+  [ -n "$public_ip" ] || public_ip=$(curl -4fsS --connect-timeout 3 --max-time 5 https://icanhazip.com 2>/dev/null || true)
+elif command -v wget >/dev/null 2>&1; then
+  public_ip=$(wget -4 -qO- -T 5 https://api.ipify.org 2>/dev/null || true)
+  [ -n "$public_ip" ] || public_ip=$(wget -4 -qO- -T 5 https://icanhazip.com 2>/dev/null || true)
+fi
+public_ip=$(printf '%s' "$public_ip" | tr -d '\r\n ')
+printf 'cpu_percent=%s\n' "$cpu_percent"
+printf 'memory_percent=%s\n' "$mem_percent"
+printf 'memory_used_bytes=%s\n' "$((mem_used_kb * 1024))"
+printf 'memory_total_bytes=%s\n' "$((mem_total_kb * 1024))"
+printf 'swap_percent=%s\n' "$swap_percent"
+printf 'swap_used_bytes=%s\n' "$((swap_used_kb * 1024))"
+printf 'swap_total_bytes=%s\n' "$((swap_total_kb * 1024))"
+printf 'disk_percent=%s\n' "$disk_percent"
+printf 'disk_used_bytes=%s\n' "$((disk_used_kb * 1024))"
+printf 'disk_total_bytes=%s\n' "$((disk_total_kb * 1024))"
+printf 'download_bps=%s\n' "$((rx2 - rx1))"
+printf 'upload_bps=%s\n' "$((tx2 - tx1))"
+printf 'rx_total_bytes=%s\n' "$rx2"
+printf 'tx_total_bytes=%s\n' "$tx2"
+printf 'uptime_seconds=%s\n' "$uptime_seconds"
+printf 'os_name=%s\n' "$os_name"
+printf 'os_version=%s\n' "$os_version"
+printf 'arch=%s\n' "$(uname -m)"
+printf 'kernel_version=%s\n' "$(uname -r)"
+printf 'hostname=%s\n' "$(hostname 2>/dev/null || true)"
+printf 'public_ip=%s\n' "$public_ip"
+'''
+    for proxy in attempts:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        proxy_socket = None
+        try:
+            if proxy:
+                proxy_socket = socks.socksocket()
+                proxy_socket.set_proxy(
+                    socks.SOCKS5,
+                    proxy["host"],
+                    int(proxy["port"]),
+                    True,
+                    proxy.get("username") or None,
+                    proxy.get("password") or None,
+                )
+                proxy_socket.settimeout(SSH_TIMEOUT)
+                proxy_socket.connect((vps["host"], int(vps.get("ssh_port") or 22)))
+            client.connect(
+                hostname=vps["host"],
+                port=int(vps.get("ssh_port") or 22),
+                username=vps["login_username"],
+                password=password,
+                timeout=SSH_TIMEOUT,
+                banner_timeout=SSH_TIMEOUT,
+                auth_timeout=SSH_TIMEOUT,
+                allow_agent=False,
+                look_for_keys=False,
+                sock=proxy_socket,
+            )
+            _, stdout, stderr = client.exec_command(command, timeout=SSH_TIMEOUT + 14)
+            output = stdout.read().decode("utf-8", "replace")
+            error_text = stderr.read().decode("utf-8", "replace").strip()
+            if stdout.channel.recv_exit_status() != 0:
+                raise RuntimeError(error_text or "无法读取系统指标")
+            metrics = {}
+            for line in output.splitlines():
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                metrics[key.strip()] = value.strip()
+            required = {"cpu_percent", "memory_percent", "disk_percent", "uptime_seconds"}
+            if not required.issubset(metrics):
+                raise RuntimeError("系统指标返回不完整")
+            for key in ("cpu_percent", "memory_percent", "swap_percent", "disk_percent"):
+                metrics[key] = round(max(0.0, min(float(metrics.get(key) or 0), 100.0)), 1)
+            for key in (
+                "memory_used_bytes", "memory_total_bytes", "swap_used_bytes", "swap_total_bytes",
+                "disk_used_bytes", "disk_total_bytes", "download_bps", "upload_bps",
+                "rx_total_bytes", "tx_total_bytes", "uptime_seconds",
+            ):
+                metrics[key] = max(int(float(metrics.get(key) or 0)), 0)
+            detected_ip = metrics.get("public_ip") or ""
+            try:
+                metrics["public_ip"] = str(ipaddress.ip_address(detected_ip))
+                metrics["public_ip_detected"] = True
+            except ValueError:
+                metrics["public_ip"] = vps.get("host") or ""
+                metrics["public_ip_detected"] = False
+            return metrics
+        except paramiko.AuthenticationException:
+            raise
+        except (OSError, paramiko.SSHException, RuntimeError, ValueError) as exc:
+            errors.append(exc)
+        finally:
+            client.close()
+            if proxy_socket:
+                try:
+                    proxy_socket.close()
+                except OSError:
+                    pass
+    if errors:
+        raise errors[-1]
+    raise RuntimeError("SSH 系统指标读取失败")
+
+
+def check_metrics_one(vps_row):
+    vps = dict(vps_row)
+    checked_at = now_local().isoformat(timespec="seconds")
+    try:
+        password = decrypt_password(vps.get("login_password_encrypted"))
+        if not vps.get("login_username") or not password:
+            raise ValueError("未填写 SSH 用户名或密码")
+        metrics = ssh_collect_metrics(
+            vps, password, transport_proxy=get_cloudflare_transport_proxy()
+        )
+        with db_connection() as conn:
+            conn.execute(
+                "UPDATE vps SET metrics_json=?, metrics_last_check=?, metrics_error=NULL WHERE id=?",
+                (json.dumps(metrics, ensure_ascii=False), checked_at, vps["id"]),
+            )
+    except paramiko.AuthenticationException:
+        error_message = "SSH 用户名或密码错误"
+    except (OSError, paramiko.SSHException, RuntimeError, ValueError) as exc:
+        error_message = str(exc) or "SSH 系统指标读取失败"
+    else:
+        return
+    with db_connection() as conn:
+        conn.execute(
+            "UPDATE vps SET metrics_last_check=?, metrics_error=? WHERE id=?",
+            (checked_at, error_message[:300], vps["id"]),
+        )
+
+
+def run_metrics_checks():
+    if not metrics_check_lock.acquire(blocking=False):
+        return
+    try:
+        with db_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM vps
+                WHERE login_username IS NOT NULL AND login_username != ''
+                  AND login_password_encrypted IS NOT NULL AND login_password_encrypted != ''
+                ORDER BY id
+                """
+            ).fetchall()
+        if rows:
+            with ThreadPoolExecutor(max_workers=min(5, len(rows))) as pool:
+                list(pool.map(check_metrics_one, rows))
+    finally:
+        metrics_check_lock.release()
 
 
 def fetch_sui_summary(vps):
@@ -1042,6 +1251,7 @@ def run_all_checks():
 
 def monitor_loop():
     last_traffic_run = 0.0
+    last_metrics_run = 0.0
     last_sui_run = 0.0
     last_proxy_run = 0.0
     last_cf_run = 0.0
@@ -1051,6 +1261,9 @@ def monitor_loop():
             if time.monotonic() - last_traffic_run >= TRAFFIC_CHECK_INTERVAL:
                 run_traffic_checks()
                 last_traffic_run = time.monotonic()
+            if time.monotonic() - last_metrics_run >= METRICS_CHECK_INTERVAL:
+                run_metrics_checks()
+                last_metrics_run = time.monotonic()
             if time.monotonic() - last_sui_run >= SUI_CHECK_INTERVAL:
                 run_sui_checks()
                 last_sui_run = time.monotonic()
@@ -1094,10 +1307,45 @@ def serialize_vps(row):
         min(round(item["traffic_used_gb"] / float(total_gb) * 100, 1), 100)
         if total_gb and float(total_gb) > 0 else 0
     )
+    latency = item.get("latency_ms")
+    item["latency_quality_percent"] = (
+        max(5, min(100, round(100 - float(latency) / 3, 1)))
+        if latency is not None else 0
+    )
+    packet_loss = item.get("packet_loss_pct")
+    item["packet_loss_pct"] = round(float(packet_loss), 1) if packet_loss is not None else None
+    item["packet_quality_percent"] = (
+        max(0, min(100, round(100 - float(packet_loss), 1)))
+        if packet_loss is not None else 0
+    )
     try:
         item["sui_summary"] = json.loads(item.get("sui_summary_json") or "{}")
     except (TypeError, ValueError):
         item["sui_summary"] = {}
+    try:
+        item["metrics"] = json.loads(item.get("metrics_json") or "{}")
+    except (TypeError, ValueError):
+        item["metrics"] = {}
+    metrics = item["metrics"]
+    item["metrics_available"] = bool(metrics) and not item.get("metrics_error")
+    if metrics:
+        metrics["memory_display"] = (
+            f"{format_bytes(metrics.get('memory_used_bytes'))} / "
+            f"{format_bytes(metrics.get('memory_total_bytes'))}"
+        )
+        metrics["swap_display"] = (
+            f"{format_bytes(metrics.get('swap_used_bytes'))} / "
+            f"{format_bytes(metrics.get('swap_total_bytes'))}"
+        )
+        metrics["disk_display"] = (
+            f"{format_bytes(metrics.get('disk_used_bytes'))} / "
+            f"{format_bytes(metrics.get('disk_total_bytes'))}"
+        )
+        metrics["download_display"] = format_rate(metrics.get("download_bps"))
+        metrics["upload_display"] = format_rate(metrics.get("upload_bps"))
+        metrics["rx_total_display"] = format_bytes(metrics.get("rx_total_bytes"))
+        metrics["tx_total_display"] = format_bytes(metrics.get("tx_total_bytes"))
+        metrics["uptime_display"] = format_duration(metrics.get("uptime_seconds"))
     return item
 
 
@@ -1142,6 +1390,25 @@ def format_bytes(value):
         size /= 1024
         index += 1
     return f"{size:,.2f} {units[index]}"
+
+
+def format_rate(value):
+    return f"{format_bytes(value)}/s"
+
+
+def format_duration(value):
+    try:
+        seconds = max(int(value or 0), 0)
+    except (TypeError, ValueError):
+        return "—"
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes = seconds // 60
+    if days:
+        return f"{days} 天 {hours} 小时"
+    if hours:
+        return f"{hours} 小时 {minutes} 分钟"
+    return f"{minutes} 分钟"
 
 
 app.jinja_env.filters["bytesfmt"] = format_bytes
@@ -2306,6 +2573,7 @@ def check_now():
     def manual_checks():
         run_all_checks()
         run_traffic_checks()
+        run_metrics_checks()
         run_sui_checks()
         run_proxy_checks()
         run_cloudflare_checks()
