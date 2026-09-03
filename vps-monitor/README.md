@@ -47,6 +47,6 @@ METRICS_CHECK_INTERVAL=30
 LIVE_NETWORK_INTERVAL=2
 ```
 
-SOCKS5 落地列表默认只显示地址和端口，密码以星号遮挡。管理员点击“显示”时，页面才通过已登录的后台临时读取真实密码；复制完整地址和 CFnew 格式仍会复制完整认证信息。
+SOCKS5 落地列表默认显示地址和端口，账号与密码均以星号遮挡。管理员点击“显示”时，页面才通过已登录的后台临时读取真实账号和密码；复制完整地址和 CFnew 格式仍会复制完整认证信息。
 
 部署前请备份 `app.py`、`docker-compose.yml`、模板和数据库。真实的 SSH 密码、Telegram Token、钉钉 Webhook 与数据库不得提交到 GitHub。
