@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}代理节点与SOCKS5落地 · VPS监控中心{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div><h1>代理节点与 SOCKS5 落地</h1><p class="muted">所有S-UI、Workers和Pages节点，都可以自由选择一个公共SOCKS5出口。</p></div>
+  <div class="head-actions"><a class="button" href="{{ url_for('add_proxy_endpoint') }}">＋ 添加SOCKS5出口</a><a class="button primary" href="{{ url_for('add_cloudflare_panel') }}">＋ 接入Workers / Pages</a></div>
+</div>
+
+<section class="stats proxy-stats">
+  <div class="card stat"><span>代理节点</span><strong>{{ counts.nodes }}</strong></div>
+  <div class="card stat"><span>S-UI节点</span><strong>{{ counts.sui }}</strong></div>
+  <div class="card stat"><span>Cloudflare节点</span><strong>{{ counts.cloudflare }}</strong></div>
+  <div class="card stat online"><span>SOCKS5可用</span><strong>{{ counts.proxy_online }} / {{ counts.proxies }}</strong></div>
+</section>
+<div class="toolbar">
+  <form method="post" action="{{ url_for('check_proxy_nodes_now') }}"><button class="button" type="submit">立即检测全部</button></form>
+  <span class="muted toolbar-note">选择出口并点击“保存并应用”后，才会修改远端节点。</span>
+</div>
+
+<section class="section-head"><div><h2>代理节点</h2><p class="muted">前置节点和落地出口是分开的，同一个出口可以重复使用。</p></div></section>
+<section class="card table-card">
+  <div class="table-wrap"><table class="node-table"><thead><tr><th>类型 / 状态</th><th>代理节点</th><th>当前SOCKS5出口</th><th>远端同步</th><th>选择落地出口</th><th>操作</th></tr></thead><tbody>
+  {% for node in sui_nodes %}
+    <tr>
+      <td><span class="type-badge sui">S-UI</span><span class="status {{ 'offline' if node.sui_error else 'online' }}">{{ '异常' if node.sui_error else '在线' }}</span></td>
+      <td><strong>{{ node.name }}</strong><small>{{ node.host }}</small>{% if node.sui_error %}<small class="traffic-error">{{ node.sui_error }}</small>{% endif %}</td>
+      <td>{% if node.proxy %}<strong>{{ node.proxy.name }}</strong><small>{{ node.proxy.masked_address }} · {{ node.proxy.exit_ip or '出口IP待检测' }}</small>{% else %}<span class="muted">直连（未选择落地）</span>{% endif %}</td>
+      <td><span class="sync-badge {{ 'synced' if node.proxy_config_synced else 'pending' }}">{{ '已应用' if node.proxy_config_synced else '待应用' }}</span>{% if node.proxy_config_error %}<small class="traffic-error">{{ node.proxy_config_error }}</small>{% endif %}</td>
+      <td><form class="bind-form" method="post" action="{{ url_for('bind_sui_proxy', vps_id=node.id) }}" onsubmit="return confirm('系统会先备份S-UI，然后修改出站和路由。确定继续？')"><select name="proxy_id"><option value="">不使用SOCKS5（恢复直连）</option>{% for proxy in proxies %}<option value="{{ proxy.id }}" {% if node.proxy_id == proxy.id %}selected{% endif %}>{{ proxy.name }} · {{ proxy.host }}:{{ proxy.port }}</option>{% endfor %}</select><button class="button primary small-button" type="submit">保存并应用</button></form></td>
+      <td class="actions"><a href="{{ url_for('sui_detail', vps_id=node.id) }}">S-UI管理</a></td>
+    </tr>
+  {% endfor %}
+  {% for node in cloudflare_nodes %}
+    <tr>
+      <td><span class="type-badge cf">{{ 'Workers' if node.panel_type == 'worker' else 'Pages' }} · {{ 'Edgetunnel' if node.panel_engine == 'edgetunnel' else 'CFnew' }}</span><span class="status {{ node.status }}">{{ {'online':'在线','offline':'异常','unknown':'待检测'}.get(node.status,'待检测') }}</span></td>
+      <td><strong>{{ node.name }}</strong><small class="url-text">{{ node.panel_url }}</small>{% if node.error %}<small class="traffic-error">{{ node.error }}</small>{% endif %}</td>
+      <td>{% if node.proxy %}<strong>{{ node.proxy.name }}</strong><small>{{ node.proxy.masked_address }} · {{ node.strategy_label }}</small>{% else %}<span class="muted">直连（未选择落地）</span>{% endif %}</td>
+      <td><span class="sync-badge {{ 'synced' if node.config_synced else 'pending' }}">{{ '已应用' if node.config_synced else '待应用' }}</span>{% if node.config_error %}<small class="traffic-error">{{ node.config_error }}</small>{% endif %}</td>
+      <td><form class="bind-form" method="post" action="{{ url_for('bind_cloudflare_proxy', panel_id=node.id) }}" onsubmit="return confirm('只会修改远程面板的SOCKS5出口，确定继续？')"><select name="proxy_id"><option value="">不使用SOCKS5（恢复直连）</option>{% for proxy in proxies %}<option value="{{ proxy.id }}" {% if node.proxy_id == proxy.id %}selected{% endif %}>{{ proxy.name }} · {{ proxy.host }}:{{ proxy.port }}</option>{% endfor %}</select><button class="button primary small-button" type="submit">保存并应用</button></form></td>
+      <td class="actions"><a href="{{ node.panel_url }}" target="_blank" rel="noopener">打开面板</a><a href="{{ url_for('edit_cloudflare_panel', panel_id=node.id) }}">编辑</a><form method="post" action="{{ url_for('delete_cloudflare_panel', panel_id=node.id) }}" onsubmit="return confirm('只删除监控记录，不会删除Cloudflare上的项目。确定吗？')"><button class="link danger">删除</button></form></td>
+    </tr>
+  {% endfor %}
+  {% if not sui_nodes and not cloudflare_nodes %}<tr><td colspan="6" class="empty">还没有代理节点。启用VPS的S-UI管理，或者点击右上角接入Workers / Pages。</td></tr>{% endif %}
+  </tbody></table></div>
+</section>
+
+<section class="section-head proxy-section"><div><h2>SOCKS5落地出口</h2><p class="muted">系统会通过SOCKS5真实访问外网，检测认证、延迟和出口IP，而不只是检查端口。</p></div><form method="post" action="{{ url_for('check_proxy_endpoints_now') }}"><button class="button">检测全部出口</button></form></section>
+<section class="card table-card">
+  <div class="table-wrap"><table><thead><tr><th>状态</th><th>出口名称</th><th>地址</th><th>真实出口IP</th><th>延迟 / 最近检测</th><th>操作</th></tr></thead><tbody>
+  {% for proxy in proxies %}<tr>
+    <td><span class="status {{ proxy.status }}">{{ {'online':'可用','offline':'不可用','unknown':'待检测'}.get(proxy.status,'待检测') }}</span></td>
+    <td><strong>{{ proxy.name }}</strong>{% if not proxy.enabled %}<small>已暂停自动检测</small>{% endif %}{% if proxy.error %}<small class="traffic-error">{{ proxy.error }}</small>{% endif %}</td>
+    <td><strong>{{ proxy.host }}:{{ proxy.port }}</strong><small><span data-proxy-password="{{ proxy.id }}">密码：********</span> <button class="link" type="button" data-revealed="0" aria-expanded="false" onclick="toggleProxyPassword({{ proxy.id }}, this)">显示</button></small></td>
+    <td><strong>{{ proxy.exit_ip or '—' }}</strong></td>
+    <td>{{ (proxy.latency_ms|string + ' ms') if proxy.latency_ms is not none else '—' }}<small>{{ proxy.last_check[:19].replace('T',' ') if proxy.last_check else '尚未检测' }}</small></td>
+    <td class="actions"><button class="link" type="button" onclick="copyProxy({{ proxy.id }}, 'uri', this)">复制完整地址</button><button class="link" type="button" onclick="copyProxy({{ proxy.id }}, 'cfnew_value', this)">复制CFnew格式</button><a href="{{ url_for('edit_proxy_endpoint', proxy_id=proxy.id) }}">编辑</a><form method="post" action="{{ url_for('delete_proxy_endpoint', proxy_id=proxy.id) }}" onsubmit="return confirm('确定删除这个SOCKS5出口？')"><button class="link danger">删除</button></form></td>
+  </tr>{% else %}<tr><td colspan="6" class="empty">还没有SOCKS5落地出口，请先点击右上角添加。</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+<script>
+async function writeClipboard(text){if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(text);return;}const box=document.createElement('textarea');box.value=text;box.style.position='fixed';box.style.opacity='0';document.body.appendChild(box);box.select();document.execCommand('copy');box.remove();}
+async function getProxySecret(id){const response=await fetch(`/proxy-endpoints/${id}/secret`,{method:'POST'});const result=await response.json();if(!result.ok)throw new Error(result.message||'读取失败');return result;}
+async function copyProxy(id, field, button){try{const result=await getProxySecret(id);await writeClipboard(result[field]);const old=button.textContent;button.textContent='已复制';setTimeout(()=>button.textContent=old,1200);}catch(error){alert(error.message);}}
+async function toggleProxyPassword(id, button){const target=document.querySelector(`[data-proxy-password="${id}"]`);if(!target)return;if(button.dataset.revealed==='1'){target.textContent='密码：********';button.textContent='显示';button.dataset.revealed='0';button.setAttribute('aria-expanded','false');return;}button.disabled=true;button.textContent='读取中';try{const result=await getProxySecret(id);target.textContent=`密码：${result.password||'（无密码）'}`;button.textContent='隐藏';button.dataset.revealed='1';button.setAttribute('aria-expanded','true');}catch(error){button.textContent='显示';alert(error.message);}finally{button.disabled=false;}}
+</script>
+{% endblock %}

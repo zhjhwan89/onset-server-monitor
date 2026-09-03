@@ -28,6 +28,7 @@
 volumes:
   - ./app.py:/app/app.py:ro
   - ./templates/dashboard.html:/app/templates/dashboard.html:ro
+  - ./templates/proxy_nodes.html:/app/templates/proxy_nodes.html:ro
   - ./data:/app/data
 ```
 
@@ -45,5 +46,7 @@ METRICS_CHECK_INTERVAL=30
 ```env
 LIVE_NETWORK_INTERVAL=2
 ```
+
+SOCKS5 落地列表默认只显示地址和端口，密码以星号遮挡。管理员点击“显示”时，页面才通过已登录的后台临时读取真实密码；复制完整地址和 CFnew 格式仍会复制完整认证信息。
 
 部署前请备份 `app.py`、`docker-compose.yml`、模板和数据库。真实的 SSH 密码、Telegram Token、钉钉 Webhook 与数据库不得提交到 GitHub。
