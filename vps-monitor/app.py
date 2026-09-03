@@ -50,6 +50,9 @@ PING_TIMEOUT = max(1, int(os.getenv("PING_TIMEOUT", "3")))
 TCP_TIMEOUT = max(1, int(os.getenv("TCP_TIMEOUT", "5")))
 TRAFFIC_CHECK_INTERVAL = max(60, int(os.getenv("TRAFFIC_CHECK_INTERVAL", "300")))
 METRICS_CHECK_INTERVAL = max(30, int(os.getenv("METRICS_CHECK_INTERVAL", "30")))
+LIVE_NETWORK_INTERVAL = max(2, int(os.getenv("LIVE_NETWORK_INTERVAL", "2")))
+LIVE_NETWORK_MANAGER_INTERVAL = max(5, int(os.getenv("LIVE_NETWORK_MANAGER_INTERVAL", "5")))
+LIVE_NETWORK_STALE_SECONDS = max(8, LIVE_NETWORK_INTERVAL * 4)
 SSH_TIMEOUT = max(3, int(os.getenv("SSH_TIMEOUT", "8")))
 SUI_CHECK_INTERVAL = max(60, int(os.getenv("SUI_CHECK_INTERVAL", "300")))
 SUI_TIMEOUT = max(5, int(os.getenv("SUI_TIMEOUT", "15")))
@@ -86,6 +89,10 @@ metrics_check_lock = threading.Lock()
 sui_check_lock = threading.Lock()
 proxy_check_lock = threading.Lock()
 cf_check_lock = threading.Lock()
+live_network_lock = threading.Lock()
+live_network_samples = {}
+live_network_workers = {}
+live_network_manager_thread = None
 
 
 def now_local():
@@ -870,6 +877,227 @@ def run_metrics_checks():
         metrics_check_lock.release()
 
 
+def open_live_network_ssh(vps, password, transport_proxy=None):
+    """Open one long-lived SSH connection, with the same proxy fallback as metrics."""
+    attempts = [transport_proxy, None] if transport_proxy else [None]
+    errors = []
+    for proxy in attempts:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        proxy_socket = None
+        try:
+            if proxy:
+                proxy_socket = socks.socksocket()
+                proxy_socket.set_proxy(
+                    socks.SOCKS5,
+                    proxy["host"],
+                    int(proxy["port"]),
+                    True,
+                    proxy.get("username") or None,
+                    proxy.get("password") or None,
+                )
+                proxy_socket.settimeout(SSH_TIMEOUT)
+                proxy_socket.connect((vps["host"], int(vps.get("ssh_port") or 22)))
+            client.connect(
+                hostname=vps["host"],
+                port=int(vps.get("ssh_port") or 22),
+                username=vps["login_username"],
+                password=password,
+                timeout=SSH_TIMEOUT,
+                banner_timeout=SSH_TIMEOUT,
+                auth_timeout=SSH_TIMEOUT,
+                allow_agent=False,
+                look_for_keys=False,
+                sock=proxy_socket,
+            )
+            transport = client.get_transport()
+            if transport:
+                transport.set_keepalive(15)
+            return client, proxy_socket
+        except paramiko.AuthenticationException:
+            client.close()
+            if proxy_socket:
+                proxy_socket.close()
+            raise
+        except (OSError, paramiko.SSHException, RuntimeError, ValueError) as exc:
+            errors.append(exc)
+            client.close()
+            if proxy_socket:
+                try:
+                    proxy_socket.close()
+                except OSError:
+                    pass
+    if errors:
+        raise errors[-1]
+    raise RuntimeError("SSH 实时流量连接失败")
+
+
+def stream_live_network(vps, stop_event):
+    """Continuously sample interface counters over one persistent SSH channel."""
+    vps_id = int(vps["id"])
+    command = f'''\
+iface=$(ip route show default 2>/dev/null | awk 'NR==1{{print $5}}')
+[ -n "$iface" ] || iface=$(ip -6 route show default 2>/dev/null | awk 'NR==1{{print $5}}')
+[ -n "$iface" ] || exit 2
+while :; do
+  rx=$(cat "/sys/class/net/$iface/statistics/rx_bytes" 2>/dev/null) || exit 3
+  tx=$(cat "/sys/class/net/$iface/statistics/tx_bytes" 2>/dev/null) || exit 3
+  printf '%s %s\\n' "$rx" "$tx"
+  sleep {LIVE_NETWORK_INTERVAL}
+done
+'''
+    while not monitor_stop.is_set() and not stop_event.is_set():
+        client = None
+        proxy_socket = None
+        try:
+            password = decrypt_password(vps.get("login_password_encrypted"))
+            if not vps.get("login_username") or not password:
+                raise ValueError("未填写 SSH 用户名或密码")
+            client, proxy_socket = open_live_network_ssh(
+                vps, password, transport_proxy=get_cloudflare_transport_proxy()
+            )
+            _, stdout, _ = client.exec_command(command)
+            previous_rx = None
+            previous_tx = None
+            previous_time = None
+            while not monitor_stop.is_set() and not stop_event.is_set():
+                raw_line = stdout.readline()
+                if not raw_line:
+                    raise RuntimeError("SSH 实时流量连接已断开")
+                line = (
+                    raw_line.decode("utf-8", "replace")
+                    if isinstance(raw_line, bytes)
+                    else raw_line
+                ).strip()
+                parts = line.split()
+                if len(parts) != 2:
+                    continue
+                rx_bytes = max(int(parts[0]), 0)
+                tx_bytes = max(int(parts[1]), 0)
+                sampled_monotonic = time.monotonic()
+                if previous_time is not None:
+                    elapsed = max(sampled_monotonic - previous_time, 0.001)
+                    download_bps = max((rx_bytes - previous_rx) / elapsed, 0)
+                    upload_bps = max((tx_bytes - previous_tx) / elapsed, 0)
+                    with live_network_lock:
+                        if not stop_event.is_set():
+                            live_network_samples[vps_id] = {
+                                "download_bps": download_bps,
+                                "upload_bps": upload_bps,
+                                "rx_total_bytes": rx_bytes,
+                                "tx_total_bytes": tx_bytes,
+                                "sampled_epoch": time.time(),
+                                "sampled_at": now_local().isoformat(timespec="seconds"),
+                            }
+                previous_rx = rx_bytes
+                previous_tx = tx_bytes
+                previous_time = sampled_monotonic
+        except paramiko.AuthenticationException:
+            error_message = "SSH 用户名或密码错误"
+        except (OSError, paramiko.SSHException, RuntimeError, ValueError) as exc:
+            error_message = str(exc) or "SSH 实时流量读取失败"
+        else:
+            error_message = "SSH 实时流量连接已结束"
+        finally:
+            if client:
+                client.close()
+            if proxy_socket:
+                try:
+                    proxy_socket.close()
+                except OSError:
+                    pass
+        with live_network_lock:
+            sample = live_network_samples.get(vps_id)
+            if sample is not None:
+                sample["error"] = error_message[:200]
+        if not monitor_stop.is_set() and not stop_event.is_set():
+            stop_event.wait(5)
+
+
+def live_network_signature(vps):
+    return (
+        vps.get("host"),
+        int(vps.get("ssh_port") or 22),
+        vps.get("login_username"),
+        vps.get("login_password_encrypted"),
+    )
+
+
+def live_network_manager_loop():
+    """Keep exactly one live network worker for every VPS with SSH credentials."""
+    while not monitor_stop.is_set():
+        try:
+            with db_connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM vps
+                    WHERE login_username IS NOT NULL AND login_username != ''
+                      AND login_password_encrypted IS NOT NULL
+                      AND login_password_encrypted != ''
+                    ORDER BY id
+                    """
+                ).fetchall()
+            desired = {int(row["id"]): dict(row) for row in rows}
+            pending = []
+            with live_network_lock:
+                for vps_id, worker in list(live_network_workers.items()):
+                    wanted = desired.get(vps_id)
+                    changed = wanted and worker["signature"] != live_network_signature(wanted)
+                    if not wanted or changed:
+                        worker["stop"].set()
+                        live_network_workers.pop(vps_id, None)
+                        live_network_samples.pop(vps_id, None)
+                for vps_id, vps in desired.items():
+                    worker = live_network_workers.get(vps_id)
+                    if worker and worker["thread"].is_alive():
+                        continue
+                    stop_event = threading.Event()
+                    thread = threading.Thread(
+                        target=stream_live_network,
+                        args=(vps, stop_event),
+                        name=f"vps-network-{vps_id}",
+                        daemon=True,
+                    )
+                    live_network_workers[vps_id] = {
+                        "thread": thread,
+                        "stop": stop_event,
+                        "signature": live_network_signature(vps),
+                    }
+                    pending.append(thread)
+            for thread in pending:
+                thread.start()
+        except Exception as exc:
+            app.logger.exception("实时流量管理器出现异常：%s", exc)
+        monitor_stop.wait(LIVE_NETWORK_MANAGER_INTERVAL)
+    with live_network_lock:
+        for worker in live_network_workers.values():
+            worker["stop"].set()
+
+
+def start_live_network_monitor():
+    global live_network_manager_thread
+    if os.getenv("DISABLE_MONITOR", "0") == "1":
+        return
+    if live_network_manager_thread is None or not live_network_manager_thread.is_alive():
+        live_network_manager_thread = threading.Thread(
+            target=live_network_manager_loop,
+            name="vps-network-manager",
+            daemon=True,
+        )
+        live_network_manager_thread.start()
+
+
+def get_live_network_sample(vps_id):
+    with live_network_lock:
+        sample = dict(live_network_samples.get(int(vps_id)) or {})
+    if not sample:
+        return None
+    age = time.time() - float(sample.get("sampled_epoch") or 0)
+    if age > LIVE_NETWORK_STALE_SECONDS:
+        return None
+    return sample
+
+
 def fetch_sui_summary(vps):
     client = get_sui_client(vps)
     status = client.get("status", {"r": "cpu,mem,net,sys,sbd,dsk,swp,dio,db"}) or {}
@@ -1645,19 +1873,39 @@ def dashboard():
 @app.get("/api/dashboard/live")
 @login_required
 def dashboard_live():
-    """Return the latest cached VPS metrics for the dashboard's live refresh."""
+    """Return system snapshots plus independently streamed network counters."""
     with db_connection() as conn:
         rows = conn.execute("SELECT * FROM vps ORDER BY id").fetchall()
     servers = []
+    live_network_count = 0
+    live_network_target_count = 0
     for row in rows:
         item = serialize_vps(row)
         metrics = item.get("metrics") or {}
+        has_ssh_credentials = bool(
+            item.get("login_username") and item.get("login_password_encrypted")
+        )
+        live_network_target_count += int(has_ssh_credentials)
+        network_sample = get_live_network_sample(item["id"])
+        network_live = network_sample is not None
+        if network_live:
+            live_network_count += 1
+            metrics["upload_display"] = format_rate(network_sample["upload_bps"])
+            metrics["download_display"] = format_rate(network_sample["download_bps"])
+            metrics["tx_total_display"] = format_bytes(
+                network_sample["tx_total_bytes"], precision=5
+            )
+            metrics["rx_total_display"] = format_bytes(
+                network_sample["rx_total_bytes"], precision=5
+            )
         servers.append({
             "id": item["id"],
             "status": item.get("status") or "unknown",
             "metrics_available": item.get("metrics_available", False),
             "metrics_last_check": item.get("metrics_last_check"),
             "metrics_error": item.get("metrics_error"),
+            "network_live": network_live,
+            "network_last_check": network_sample.get("sampled_at") if network_sample else None,
             "traffic_percent": item.get("traffic_percent", 0),
             "latency_ms": item.get("latency_ms"),
             "packet_loss_pct": item.get("packet_loss_pct"),
@@ -1677,7 +1925,10 @@ def dashboard_live():
         "ok": True,
         "server_time": now_local().isoformat(timespec="seconds"),
         "metrics_interval": METRICS_CHECK_INTERVAL,
-        "browser_refresh_interval": 5,
+        "network_interval": LIVE_NETWORK_INTERVAL,
+        "browser_refresh_interval": LIVE_NETWORK_INTERVAL,
+        "live_network_count": live_network_count,
+        "live_network_target_count": live_network_target_count,
         "servers": servers,
     }
 
@@ -2680,6 +2931,7 @@ def health():
 
 init_db()
 start_monitor()
+start_live_network_monitor()
 atexit.register(monitor_stop.set)
 
 

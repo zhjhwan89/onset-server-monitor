@@ -268,6 +268,7 @@
 
   const liveStatus = document.getElementById('vm-live-status');
   let lastSample = '';
+  let lastNetworkSample = '';
   function updateText(element, value) {
     if (!element || element.textContent === value) return;
     element.textContent = value;
@@ -302,24 +303,28 @@
           setPercent(card, field, metrics[field], available);
         });
         setPercent(card, 'traffic_percent', server.traffic_percent, true);
+        const networkAvailable = Boolean(server.network_live) || available;
         ['upload_display', 'download_display', 'tx_total_display', 'rx_total_display'].forEach(field => {
-          updateText(card.querySelector(`[data-live-field="${field}"]`), available ? (metrics[field] || '—') : '—');
+          updateText(card.querySelector(`[data-live-field="${field}"]`), networkAvailable ? (metrics[field] || '—') : '—');
         });
         if (server.metrics_last_check && (!lastSample || server.metrics_last_check > lastSample)) {
           lastSample = server.metrics_last_check;
         }
+        if (server.network_last_check && (!lastNetworkSample || server.network_last_check > lastNetworkSample)) {
+          lastNetworkSample = server.network_last_check;
+        }
       });
       apply();
       liveStatus.dataset.state = 'ok';
-      const sampleTime = lastSample ? lastSample.replace('T', ' ').slice(5, 19) : '等待首次采集';
-      liveStatus.textContent = `自动更新正常 · 页面每 ${data.browser_refresh_interval || 5} 秒读取 · 后台每 ${data.metrics_interval || 30} 秒采样 · 最近 ${sampleTime}`;
+      const networkTime = lastNetworkSample ? lastNetworkSample.replace('T', ' ').slice(5, 19) : '等待首次采集';
+      liveStatus.textContent = `网络实时采样 ${data.live_network_count || 0}/${data.live_network_target_count || 0} 台 · 每 ${data.network_interval || 2} 秒 · 最近 ${networkTime} · CPU/内存每 ${data.metrics_interval || 30} 秒`;
     } catch (error) {
       liveStatus.dataset.state = 'error';
       liveStatus.textContent = '自动更新暂时断开，正在重试…';
     }
   }
   refreshLiveData();
-  window.setInterval(refreshLiveData, 5000);
+  window.setInterval(refreshLiveData, 2000);
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) refreshLiveData();
   });
