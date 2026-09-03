@@ -31,10 +31,13 @@ volumes:
   - ./data:/app/data
 ```
 
+首页每 5 秒从面板读取一次最新缓存，CPU、内存、网卡速率和累计流量默认每 30 秒通过 SSH 重新采样。页面不会为了刷新数据而反复建立 SSH 连接。
+累计上传和下载保留 5 位小数，避免低流量服务器长时间看起来完全不变。
+
 可通过环境变量调整系统指标采集间隔，单位为秒，最小值为 30 秒：
 
 ```env
-METRICS_CHECK_INTERVAL=60
+METRICS_CHECK_INTERVAL=30
 ```
 
 部署前请备份 `app.py`、`docker-compose.yml`、模板和数据库。真实的 SSH 密码、Telegram Token、钉钉 Webhook 与数据库不得提交到 GitHub。

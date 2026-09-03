@@ -49,7 +49,7 @@ FAILURE_THRESHOLD = max(1, int(os.getenv("FAILURE_THRESHOLD", "3")))
 PING_TIMEOUT = max(1, int(os.getenv("PING_TIMEOUT", "3")))
 TCP_TIMEOUT = max(1, int(os.getenv("TCP_TIMEOUT", "5")))
 TRAFFIC_CHECK_INTERVAL = max(60, int(os.getenv("TRAFFIC_CHECK_INTERVAL", "300")))
-METRICS_CHECK_INTERVAL = max(30, int(os.getenv("METRICS_CHECK_INTERVAL", "60")))
+METRICS_CHECK_INTERVAL = max(30, int(os.getenv("METRICS_CHECK_INTERVAL", "30")))
 SSH_TIMEOUT = max(3, int(os.getenv("SSH_TIMEOUT", "8")))
 SUI_CHECK_INTERVAL = max(60, int(os.getenv("SUI_CHECK_INTERVAL", "300")))
 SUI_TIMEOUT = max(5, int(os.getenv("SUI_TIMEOUT", "15")))
@@ -1250,6 +1250,7 @@ def run_all_checks():
 
 
 def monitor_loop():
+    last_check_run = 0.0
     last_traffic_run = 0.0
     last_metrics_run = 0.0
     last_sui_run = 0.0
@@ -1257,7 +1258,9 @@ def monitor_loop():
     last_cf_run = 0.0
     while not monitor_stop.is_set():
         try:
-            run_all_checks()
+            if time.monotonic() - last_check_run >= CHECK_INTERVAL:
+                run_all_checks()
+                last_check_run = time.monotonic()
             if time.monotonic() - last_traffic_run >= TRAFFIC_CHECK_INTERVAL:
                 run_traffic_checks()
                 last_traffic_run = time.monotonic()
@@ -1275,7 +1278,9 @@ def monitor_loop():
                 last_cf_run = time.monotonic()
         except Exception as exc:
             app.logger.exception("监控循环出现异常：%s", exc)
-        monitor_stop.wait(CHECK_INTERVAL)
+        # Use a short scheduler tick so metrics can refresh independently from
+        # the slower online, traffic, S-UI and proxy checks.
+        monitor_stop.wait(2)
 
 
 def start_monitor():
@@ -1343,8 +1348,10 @@ def serialize_vps(row):
         )
         metrics["download_display"] = format_rate(metrics.get("download_bps"))
         metrics["upload_display"] = format_rate(metrics.get("upload_bps"))
-        metrics["rx_total_display"] = format_bytes(metrics.get("rx_total_bytes"))
-        metrics["tx_total_display"] = format_bytes(metrics.get("tx_total_bytes"))
+        # Totals need more precision than capacity values; otherwise a low-traffic
+        # VPS can run for an hour before a two-decimal GB value visibly changes.
+        metrics["rx_total_display"] = format_bytes(metrics.get("rx_total_bytes"), precision=5)
+        metrics["tx_total_display"] = format_bytes(metrics.get("tx_total_bytes"), precision=5)
         metrics["uptime_display"] = format_duration(metrics.get("uptime_seconds"))
     return item
 
@@ -1379,7 +1386,7 @@ def format_amount(cents, currency):
     return f"{currency} {CURRENCIES[currency]}{(cents or 0) / 100:,.2f}"
 
 
-def format_bytes(value):
+def format_bytes(value, precision=2):
     try:
         size = float(value or 0)
     except (TypeError, ValueError):
@@ -1389,7 +1396,7 @@ def format_bytes(value):
     while abs(size) >= 1024 and index < len(units) - 1:
         size /= 1024
         index += 1
-    return f"{size:,.2f} {units[index]}"
+    return f"{size:,.{precision}f} {units[index]}"
 
 
 def format_rate(value):
@@ -1633,6 +1640,46 @@ def dashboard():
         "total_display": total_display,
     }
     return render_template("dashboard.html", servers=servers, counts=counts)
+
+
+@app.get("/api/dashboard/live")
+@login_required
+def dashboard_live():
+    """Return the latest cached VPS metrics for the dashboard's live refresh."""
+    with db_connection() as conn:
+        rows = conn.execute("SELECT * FROM vps ORDER BY id").fetchall()
+    servers = []
+    for row in rows:
+        item = serialize_vps(row)
+        metrics = item.get("metrics") or {}
+        servers.append({
+            "id": item["id"],
+            "status": item.get("status") or "unknown",
+            "metrics_available": item.get("metrics_available", False),
+            "metrics_last_check": item.get("metrics_last_check"),
+            "metrics_error": item.get("metrics_error"),
+            "traffic_percent": item.get("traffic_percent", 0),
+            "latency_ms": item.get("latency_ms"),
+            "packet_loss_pct": item.get("packet_loss_pct"),
+            "metrics": {
+                "cpu_percent": metrics.get("cpu_percent", 0),
+                "memory_percent": metrics.get("memory_percent", 0),
+                "swap_percent": metrics.get("swap_percent", 0),
+                "disk_percent": metrics.get("disk_percent", 0),
+                "upload_display": metrics.get("upload_display", "—"),
+                "download_display": metrics.get("download_display", "—"),
+                "tx_total_display": metrics.get("tx_total_display", "—"),
+                "rx_total_display": metrics.get("rx_total_display", "—"),
+                "uptime_display": metrics.get("uptime_display", "—"),
+            },
+        })
+    return {
+        "ok": True,
+        "server_time": now_local().isoformat(timespec="seconds"),
+        "metrics_interval": METRICS_CHECK_INTERVAL,
+        "browser_refresh_interval": 5,
+        "servers": servers,
+    }
 
 
 def parse_server_form():
@@ -1902,6 +1949,17 @@ def sui_overview():
         "online_users": sum(len((v.get("sui_summary") or {}).get("onlines", {}).get("user", []) or []) for v in enabled),
     }
     return render_template("sui_overview.html", servers=servers, counts=counts)
+
+
+@app.get("/sui/connect")
+@login_required
+def sui_connect():
+    with db_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM vps WHERE sui_enabled=0 ORDER BY name"
+        ).fetchall()
+    servers = [serialize_vps(row) for row in rows]
+    return render_template("sui_connect.html", servers=servers)
 
 
 @app.post("/sui/check-now")

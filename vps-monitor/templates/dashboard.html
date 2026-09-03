@@ -22,6 +22,10 @@
   .vm-hero h1 { margin:0; font-size:30px; letter-spacing:-.5px; }
   .vm-hero p { margin:8px 0 0; color:var(--vm-muted); }
   .vm-actions { display:flex; gap:10px; flex-wrap:wrap; }
+  .vm-live-status { display:inline-flex; align-items:center; gap:7px; margin-top:10px; color:#65738b; font-size:12px; }
+  .vm-live-status::before { content:""; width:7px; height:7px; border-radius:50%; background:#22c783; box-shadow:0 0 8px rgba(34,199,131,.55); }
+  .vm-live-status[data-state="loading"]::before { background:#ff9f43; }
+  .vm-live-status[data-state="error"]::before { background:#f04461; }
   .vm-btn { display:inline-flex; align-items:center; justify-content:center; gap:7px; min-height:40px; padding:0 15px; border:1px solid var(--vm-line); border-radius:11px; background:#fff; color:#32405a; font-weight:700; text-decoration:none; cursor:pointer; box-shadow:0 4px 14px rgba(40,55,80,.05); }
   .vm-btn:hover { border-color:#b8c5da; transform:translateY(-1px); }
   .vm-btn-primary { color:#fff; border-color:#326ce5; background:linear-gradient(135deg,#4b83f5,#2864dc); }
@@ -76,6 +80,8 @@
   .vm-live-item { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:12px; color:#64728a; }
   .vm-live-item strong { color:#28a987; font-size:12px; }
   .vm-live-item:nth-child(even) strong { color:#3b83cf; }
+  .vm-value-updated { animation:vm-value-pulse .8s ease; }
+  @keyframes vm-value-pulse { 0% { background:#fff1a8; transform:scale(1.08); } 100% { background:transparent; transform:scale(1); } }
   .vm-quality { margin:0 -18px -18px; padding:13px 18px 15px; background:linear-gradient(180deg,#fbfcfe,#f5f8fb); border-top:1px solid var(--vm-line); }
   .vm-quality-row { display:grid; grid-template-columns:86px minmax(0,1fr) 56px; align-items:center; gap:8px; margin:7px 0; font-size:12px; color:#56647a; }
   .vm-quality-row strong { text-align:right; color:#34425a; }
@@ -118,6 +124,7 @@
     <div>
       <h1>服务器状态中心</h1>
       <p>状态、资源、流量、网络质量和到期时间集中展示</p>
+      <div class="vm-live-status" id="vm-live-status" data-state="loading">正在连接实时数据…</div>
     </div>
     <div class="vm-actions">
       <form method="post" action="{{ url_for('check_now') }}"><button class="vm-btn" type="submit">↻ 立即检测</button></form>
@@ -145,7 +152,7 @@
 
   <section class="vm-grid" id="vm-grid">
     {% for vps in servers %}
-    <article class="vm-card" data-status="{{ vps.status }}" data-due="{{ 1 if vps.days_left is not none and vps.days_left <= 3 else 0 }}" data-search="{{ (vps.name ~ ' ' ~ vps.host ~ ' ' ~ (vps.provider or ''))|lower }}">
+    <article class="vm-card" data-vps-id="{{ vps.id }}" data-status="{{ vps.status }}" data-due="{{ 1 if vps.days_left is not none and vps.days_left <= 3 else 0 }}" data-search="{{ (vps.name ~ ' ' ~ vps.host ~ ' ' ~ (vps.provider or ''))|lower }}">
       <div class="vm-card-head">
         <div class="vm-title-wrap">
           <span class="vm-lights" aria-label="{{ vps.status }}"><i class="vm-light ok"></i><i class="vm-light bad"></i></span>
@@ -172,35 +179,35 @@
       {% set live = vps.metrics_available %}
       <div class="vm-metric">
         <span class="vm-metric-label">⚙ CPU</span>
-        <span class="vm-track {{ '' if live else 'unknown' }}"><i class="vm-fill cpu" style="--value:{{ vps.metrics.cpu_percent if live else 0 }}%"></i></span>
-        <span class="vm-metric-value">{{ (vps.metrics.cpu_percent|string ~ '%') if live else '待采集' }}</span>
+        <span class="vm-track {{ '' if live else 'unknown' }}" data-track="cpu_percent"><i class="vm-fill cpu" data-fill="cpu_percent" style="--value:{{ vps.metrics.cpu_percent if live else 0 }}%"></i></span>
+        <span class="vm-metric-value" data-live-field="cpu_percent">{{ (vps.metrics.cpu_percent|string ~ '%') if live else '待采集' }}</span>
       </div>
       <div class="vm-metric">
         <span class="vm-metric-label">▦ 内存</span>
-        <span class="vm-track {{ '' if live else 'unknown' }}"><i class="vm-fill memory" style="--value:{{ vps.metrics.memory_percent if live else 0 }}%"></i></span>
-        <span class="vm-metric-value">{{ (vps.metrics.memory_percent|string ~ '%') if live else '待采集' }}</span>
+        <span class="vm-track {{ '' if live else 'unknown' }}" data-track="memory_percent"><i class="vm-fill memory" data-fill="memory_percent" style="--value:{{ vps.metrics.memory_percent if live else 0 }}%"></i></span>
+        <span class="vm-metric-value" data-live-field="memory_percent">{{ (vps.metrics.memory_percent|string ~ '%') if live else '待采集' }}</span>
       </div>
       <div class="vm-metric">
         <span class="vm-metric-label">⇄ Swap</span>
-        <span class="vm-track {{ '' if live else 'unknown' }}"><i class="vm-fill swap" style="--value:{{ vps.metrics.swap_percent if live else 0 }}%"></i></span>
-        <span class="vm-metric-value">{{ (vps.metrics.swap_percent|string ~ '%') if live else '待采集' }}</span>
+        <span class="vm-track {{ '' if live else 'unknown' }}" data-track="swap_percent"><i class="vm-fill swap" data-fill="swap_percent" style="--value:{{ vps.metrics.swap_percent if live else 0 }}%"></i></span>
+        <span class="vm-metric-value" data-live-field="swap_percent">{{ (vps.metrics.swap_percent|string ~ '%') if live else '待采集' }}</span>
       </div>
       <div class="vm-metric">
         <span class="vm-metric-label">▤ 硬盘</span>
-        <span class="vm-track {{ '' if live else 'unknown' }}"><i class="vm-fill disk" style="--value:{{ vps.metrics.disk_percent if live else 0 }}%"></i></span>
-        <span class="vm-metric-value">{{ (vps.metrics.disk_percent|string ~ '%') if live else '待采集' }}</span>
+        <span class="vm-track {{ '' if live else 'unknown' }}" data-track="disk_percent"><i class="vm-fill disk" data-fill="disk_percent" style="--value:{{ vps.metrics.disk_percent if live else 0 }}%"></i></span>
+        <span class="vm-metric-value" data-live-field="disk_percent">{{ (vps.metrics.disk_percent|string ~ '%') if live else '待采集' }}</span>
       </div>
       <div class="vm-metric">
         <span class="vm-metric-label">↕ 流量</span>
-        <span class="vm-track"><i class="vm-fill traffic" style="--value:{{ vps.traffic_percent }}%"></i></span>
-        <span class="vm-metric-value">{{ vps.traffic_percent }}%</span>
+        <span class="vm-track"><i class="vm-fill traffic" data-fill="traffic_percent" style="--value:{{ vps.traffic_percent }}%"></i></span>
+        <span class="vm-metric-value" data-live-field="traffic_percent">{{ vps.traffic_percent }}%</span>
       </div>
 
       <div class="vm-live">
-        <div class="vm-live-item"><span>↑ 实时上传</span><strong>{{ vps.metrics.upload_display if live else '—' }}</strong></div>
-        <div class="vm-live-item"><span>↓ 实时下载</span><strong>{{ vps.metrics.download_display if live else '—' }}</strong></div>
-        <div class="vm-live-item"><span>↥ 累计上传</span><strong>{{ vps.metrics.tx_total_display if live else '—' }}</strong></div>
-        <div class="vm-live-item"><span>↧ 累计下载</span><strong>{{ vps.metrics.rx_total_display if live else '—' }}</strong></div>
+        <div class="vm-live-item"><span>↑ 实时上传</span><strong data-live-field="upload_display">{{ vps.metrics.upload_display if live else '—' }}</strong></div>
+        <div class="vm-live-item"><span>↓ 实时下载</span><strong data-live-field="download_display">{{ vps.metrics.download_display if live else '—' }}</strong></div>
+        <div class="vm-live-item"><span>↥ 累计上传</span><strong data-live-field="tx_total_display">{{ vps.metrics.tx_total_display if live else '—' }}</strong></div>
+        <div class="vm-live-item"><span>↧ 累计下载</span><strong data-live-field="rx_total_display">{{ vps.metrics.rx_total_display if live else '—' }}</strong></div>
       </div>
 
       <div class="vm-card-foot">
@@ -258,6 +265,64 @@
     apply();
   }));
   search.addEventListener('input', apply);
+
+  const liveStatus = document.getElementById('vm-live-status');
+  let lastSample = '';
+  function updateText(element, value) {
+    if (!element || element.textContent === value) return;
+    element.textContent = value;
+    element.classList.remove('vm-value-updated');
+    void element.offsetWidth;
+    element.classList.add('vm-value-updated');
+  }
+  function setPercent(card, field, value, available = true) {
+    const number = Math.max(0, Math.min(Number(value) || 0, 100));
+    const fill = card.querySelector(`[data-fill="${field}"]`);
+    const track = card.querySelector(`[data-track="${field}"]`);
+    if (fill) fill.style.setProperty('--value', `${number}%`);
+    if (track) track.classList.toggle('unknown', !available);
+    updateText(card.querySelector(`[data-live-field="${field}"]`), available ? `${number}%` : '待采集');
+  }
+  async function refreshLiveData() {
+    if (document.hidden) return;
+    try {
+      const response = await fetch('{{ url_for("dashboard_live") }}', {
+        headers: {'Accept': 'application/json'},
+        cache: 'no-store',
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      (data.servers || []).forEach(server => {
+        const card = document.querySelector(`.vm-card[data-vps-id="${server.id}"]`);
+        if (!card) return;
+        card.dataset.status = server.status || 'unknown';
+        const metrics = server.metrics || {};
+        const available = Boolean(server.metrics_available);
+        ['cpu_percent', 'memory_percent', 'swap_percent', 'disk_percent'].forEach(field => {
+          setPercent(card, field, metrics[field], available);
+        });
+        setPercent(card, 'traffic_percent', server.traffic_percent, true);
+        ['upload_display', 'download_display', 'tx_total_display', 'rx_total_display'].forEach(field => {
+          updateText(card.querySelector(`[data-live-field="${field}"]`), available ? (metrics[field] || '—') : '—');
+        });
+        if (server.metrics_last_check && (!lastSample || server.metrics_last_check > lastSample)) {
+          lastSample = server.metrics_last_check;
+        }
+      });
+      apply();
+      liveStatus.dataset.state = 'ok';
+      const sampleTime = lastSample ? lastSample.replace('T', ' ').slice(5, 19) : '等待首次采集';
+      liveStatus.textContent = `自动更新正常 · 页面每 ${data.browser_refresh_interval || 5} 秒读取 · 后台每 ${data.metrics_interval || 30} 秒采样 · 最近 ${sampleTime}`;
+    } catch (error) {
+      liveStatus.dataset.state = 'error';
+      liveStatus.textContent = '自动更新暂时断开，正在重试…';
+    }
+  }
+  refreshLiveData();
+  window.setInterval(refreshLiveData, 5000);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) refreshLiveData();
+  });
 })();
 </script>
 {% endblock %}
