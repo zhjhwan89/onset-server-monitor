@@ -88,6 +88,17 @@
   .vm-quality-track { height:9px; border-radius:3px; overflow:hidden; background:repeating-linear-gradient(90deg,#dfe5ec 0 8px,transparent 8px 10px); }
   .vm-quality-fill { display:block; height:100%; width:var(--value); background:repeating-linear-gradient(90deg,#4dd69a 0 8px,transparent 8px 10px); }
   .vm-quality-fill.loss { background:repeating-linear-gradient(90deg,#65d331 0 8px,transparent 8px 10px); }
+  .vm-carrier-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin:0 0 9px; }
+  .vm-carrier-head strong { color:#34425a; font-size:13px; }
+  .vm-carrier-head small { color:#8793a5; font-size:11px; }
+  .vm-carrier-labels, .vm-carrier-row { display:grid; grid-template-columns:70px minmax(35px,1fr) 49px minmax(35px,1fr) 40px; align-items:center; gap:6px; }
+  .vm-carrier-labels { margin-bottom:4px; color:#98a2b2; font-size:10px; text-align:right; }
+  .vm-carrier-labels span:first-child { text-align:left; }
+  .vm-carrier-row { margin:7px 0; color:#56647a; font-size:11px; }
+  .vm-carrier-row > span:first-child { font-weight:800; color:#445269; white-space:nowrap; }
+  .vm-carrier-value { text-align:right; color:#22a475; font-weight:800; white-space:nowrap; }
+  .vm-carrier-loss { color:#39aa64; }
+  .vm-quality-summary { margin-top:11px; padding-top:6px; border-top:1px dashed #dfe5ec; }
   .vm-card-foot { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:13px; padding-top:12px; border-top:1px dashed var(--vm-line); }
   .vm-expiry { color:#6e7c92; font-size:12px; }
   .vm-expiry strong { color:#30405b; }
@@ -222,15 +233,33 @@
       </div>
 
       <div class="vm-quality">
+        <div class="vm-carrier-head">
+          <strong><span data-latency-location>{{ vps.latency_location }}</span>三网延迟</strong>
+          <small>VPS → 目标 · TCP</small>
+        </div>
+        <div class="vm-carrier-labels" aria-hidden="true">
+          <span>线路</span><span></span><span>延迟</span><span></span><span>丢包</span>
+        </div>
+        {% for carrier in vps.carrier_tests %}
+        <div class="vm-carrier-row" data-carrier="{{ carrier.key }}" title="检测目标：{{ carrier.target }}">
+          <span><span data-latency-location>{{ vps.latency_location }}</span>{{ carrier.label }}</span>
+          <span class="vm-quality-track"><i class="vm-quality-fill" data-carrier-latency-fill style="--value:{{ carrier.latency_quality_percent }}%"></i></span>
+          <strong class="vm-carrier-value" data-carrier-latency>{{ (carrier.latency_ms|string ~ ' ms') if carrier.latency_ms is not none else '待采集' }}</strong>
+          <span class="vm-quality-track"><i class="vm-quality-fill loss" data-carrier-loss-fill style="--value:{{ carrier.loss_quality_percent }}%"></i></span>
+          <strong class="vm-carrier-value vm-carrier-loss" data-carrier-loss>{{ (carrier.loss_pct|string ~ '%') if carrier.loss_pct is not none else '—' }}</strong>
+        </div>
+        {% endfor %}
+        <div class="vm-quality-summary">
         <div class="vm-quality-row">
-          <span>◷ 综合延迟</span>
+          <span>◷ 监控延迟</span>
           <span class="vm-quality-track"><i class="vm-quality-fill" style="--value:{{ vps.latency_quality_percent }}%"></i></span>
           <strong>{{ (vps.latency_ms|string ~ ' ms') if vps.latency_ms is not none else '—' }}</strong>
         </div>
         <div class="vm-quality-row">
-          <span>⌁ 综合丢包</span>
+          <span>⌁ 监控丢包</span>
           <span class="vm-quality-track"><i class="vm-quality-fill loss" style="--value:{{ vps.packet_quality_percent }}%"></i></span>
           <strong>{{ (vps.packet_loss_pct|string ~ '%') if vps.packet_loss_pct is not none else '待检测' }}</strong>
+        </div>
         </div>
       </div>
     </article>
@@ -307,6 +336,17 @@
         ['upload_display', 'download_display', 'tx_total_display', 'rx_total_display'].forEach(field => {
           updateText(card.querySelector(`[data-live-field="${field}"]`), networkAvailable ? (metrics[field] || '—') : '—');
         });
+        (server.carrier_tests || []).forEach(carrier => {
+          const row = card.querySelector(`[data-carrier="${carrier.key}"]`);
+          if (!row) return;
+          const latencyFill = row.querySelector('[data-carrier-latency-fill]');
+          const lossFill = row.querySelector('[data-carrier-loss-fill]');
+          if (latencyFill) latencyFill.style.setProperty('--value', `${carrier.latency_quality_percent || 0}%`);
+          if (lossFill) lossFill.style.setProperty('--value', `${carrier.loss_quality_percent || 0}%`);
+          updateText(row.querySelector('[data-carrier-latency]'), carrier.latency_ms === null ? '待采集' : `${carrier.latency_ms} ms`);
+          updateText(row.querySelector('[data-carrier-loss]'), carrier.loss_pct === null ? '—' : `${carrier.loss_pct}%`);
+          if (carrier.target) row.title = `检测目标：${carrier.target}`;
+        });
         if (server.metrics_last_check && (!lastSample || server.metrics_last_check > lastSample)) {
           lastSample = server.metrics_last_check;
         }
@@ -315,6 +355,9 @@
         }
       });
       apply();
+      document.querySelectorAll('[data-latency-location]').forEach(element => {
+        updateText(element, data.latency_location || '未设置');
+      });
       liveStatus.dataset.state = 'ok';
       const networkTime = lastNetworkSample ? lastNetworkSample.replace('T', ' ').slice(5, 19) : '等待首次采集';
       liveStatus.textContent = `网络实时采样 ${data.live_network_count || 0}/${data.live_network_target_count || 0} 台 · 每 ${data.network_interval || 2} 秒 · 最近 ${networkTime} · CPU/内存每 ${data.metrics_interval || 30} 秒`;

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import socket
 import sqlite3
 import subprocess
@@ -69,6 +70,12 @@ CURRENCIES = {
     "JPY": "¥",
     "GBP": "£",
 }
+
+LATENCY_CARRIERS = (
+    ("mobile", "移动", "zj-cm-v4.ip.zstaticcdn.com:80"),
+    ("unicom", "联通", "zj-cu-v4.ip.zstaticcdn.com:80"),
+    ("telecom", "电信", "zj-ct-v4.ip.zstaticcdn.com:80"),
+)
 
 app = Flask(
     __name__,
@@ -318,6 +325,48 @@ def set_setting(key, value):
             """,
             (key, value.strip()),
         )
+
+
+def normalize_latency_target(value):
+    """Validate a configurable IPv4/hostname TCP probe target."""
+    target = (value or "").strip()
+    if not target or len(target) > 260 or ":" not in target:
+        raise ValueError("三网检测目标必须填写为 域名或IPv4:端口")
+    host, port_text = target.rsplit(":", 1)
+    host = host.strip().rstrip(".")
+    try:
+        port = int(port_text)
+    except ValueError as exc:
+        raise ValueError("三网检测目标端口不正确") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("三网检测目标端口必须是 1-65535")
+    try:
+        ipaddress.IPv4Address(host)
+    except ValueError:
+        if (
+            not host
+            or len(host) > 253
+            or not re.fullmatch(
+                r"(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+                r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?",
+                host,
+            )
+        ):
+            raise ValueError("三网检测目标主机名不正确")
+    return f"{host}:{port}"
+
+
+def get_latency_config():
+    location = get_setting("latency_location_name", "LATENCY_LOCATION_NAME") or "浙江"
+    carriers = []
+    for key, label, default_target in LATENCY_CARRIERS:
+        target = get_setting(f"latency_{key}_target", f"LATENCY_{key.upper()}_TARGET")
+        try:
+            target = normalize_latency_target(target or default_target)
+        except ValueError:
+            target = default_target
+        carriers.append({"key": key, "label": label, "target": target})
+    return {"location": location[:20], "carriers": carriers}
 
 
 def login_required(view):
@@ -682,10 +731,20 @@ def run_traffic_checks():
         traffic_check_lock.release()
 
 
-def ssh_collect_metrics(vps, password, transport_proxy=None):
+def ssh_collect_metrics(vps, password, transport_proxy=None, latency_config=None):
     attempts = [transport_proxy, None] if transport_proxy else [None]
     errors = []
+    latency_config = latency_config or get_latency_config()
+    probe_commands = []
+    for carrier in latency_config.get("carriers", []):
+        normalized = normalize_latency_target(carrier.get("target"))
+        host, port_text = normalized.rsplit(":", 1)
+        probe_commands.append(
+            "measure_tcp %s %s %s"
+            % (shlex.quote(host), shlex.quote(port_text), shlex.quote(carrier["key"]))
+        )
     command = r'''
+LC_ALL=C
 set -- $(head -n 1 /proc/stat); shift
 total1=0; for value in "$@"; do total1=$((total1 + value)); done
 idle1=$(($4 + $5))
@@ -754,6 +813,44 @@ printf 'kernel_version=%s\n' "$(uname -r)"
 printf 'hostname=%s\n' "$(hostname 2>/dev/null || true)"
 printf 'public_ip=%s\n' "$public_ip"
 '''
+    command += r'''
+now_milliseconds() {
+  value=$(date +%s%3N 2>/dev/null || true)
+  case "$value" in
+    *N*|'') printf '%s000\n' "$(date +%s)" ;;
+    *) printf '%s\n' "$value" ;;
+  esac
+}
+measure_tcp() {
+  target_host=$1
+  target_port=$2
+  target_key=$3
+  attempts=3
+  successes=0
+  total_ms=0
+  current=1
+  while [ "$current" -le "$attempts" ]; do
+    started=$(now_milliseconds)
+    if timeout 2 bash -c "exec 3<>/dev/tcp/$target_host/$target_port" >/dev/null 2>&1; then
+      finished=$(now_milliseconds)
+      elapsed=$((finished - started))
+      [ "$elapsed" -lt 0 ] && elapsed=0
+      total_ms=$((total_ms + elapsed))
+      successes=$((successes + 1))
+    fi
+    current=$((current + 1))
+  done
+  loss=$(awk -v ok="$successes" -v total="$attempts" 'BEGIN { printf "%.1f", (total-ok)/total*100 }')
+  if [ "$successes" -gt 0 ]; then
+    latency=$(awk -v sum="$total_ms" -v ok="$successes" 'BEGIN { printf "%.1f", sum/ok }')
+  else
+    latency=''
+  fi
+  printf '%s_latency_ms=%s\n' "$target_key" "$latency"
+  printf '%s_loss_pct=%s\n' "$target_key" "$loss"
+}
+'''
+    command += "\n" + "\n".join(f"{probe} &" for probe in probe_commands) + "\nwait\n"
     for proxy in attempts:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -805,6 +902,17 @@ printf 'public_ip=%s\n' "$public_ip"
                 "rx_total_bytes", "tx_total_bytes", "uptime_seconds",
             ):
                 metrics[key] = max(int(float(metrics.get(key) or 0)), 0)
+            for carrier in latency_config.get("carriers", []):
+                key = carrier["key"]
+                latency_value = metrics.get(f"{key}_latency_ms")
+                loss_value = metrics.get(f"{key}_loss_pct")
+                metrics[f"{key}_latency_ms"] = (
+                    round(max(float(latency_value), 0.0), 1) if latency_value else None
+                )
+                metrics[f"{key}_loss_pct"] = (
+                    round(max(0.0, min(float(loss_value), 100.0)), 1)
+                    if loss_value not in (None, "") else None
+                )
             detected_ip = metrics.get("public_ip") or ""
             try:
                 metrics["public_ip"] = str(ipaddress.ip_address(detected_ip))
@@ -829,7 +937,7 @@ printf 'public_ip=%s\n' "$public_ip"
     raise RuntimeError("SSH 系统指标读取失败")
 
 
-def check_metrics_one(vps_row):
+def check_metrics_one(vps_row, latency_config=None):
     vps = dict(vps_row)
     checked_at = now_local().isoformat(timespec="seconds")
     try:
@@ -837,7 +945,10 @@ def check_metrics_one(vps_row):
         if not vps.get("login_username") or not password:
             raise ValueError("未填写 SSH 用户名或密码")
         metrics = ssh_collect_metrics(
-            vps, password, transport_proxy=get_cloudflare_transport_proxy()
+            vps,
+            password,
+            transport_proxy=get_cloudflare_transport_proxy(),
+            latency_config=latency_config,
         )
         with db_connection() as conn:
             conn.execute(
@@ -870,9 +981,10 @@ def run_metrics_checks():
                 ORDER BY id
                 """
             ).fetchall()
+        latency_config = get_latency_config()
         if rows:
             with ThreadPoolExecutor(max_workers=min(5, len(rows))) as pool:
-                list(pool.map(check_metrics_one, rows))
+                list(pool.map(lambda row: check_metrics_one(row, latency_config), rows))
     finally:
         metrics_check_lock.release()
 
@@ -1520,7 +1632,7 @@ def start_monitor():
         monitor_thread.start()
 
 
-def serialize_vps(row):
+def serialize_vps(row, latency_config=None):
     item = dict(row)
     item["renewal_amount"] = f"{(item.get('renewal_amount_cents') or 0) / 100:.2f}"
     item["amount_display"] = format_amount(
@@ -1581,6 +1693,30 @@ def serialize_vps(row):
         metrics["rx_total_display"] = format_bytes(metrics.get("rx_total_bytes"), precision=5)
         metrics["tx_total_display"] = format_bytes(metrics.get("tx_total_bytes"), precision=5)
         metrics["uptime_display"] = format_duration(metrics.get("uptime_seconds"))
+    latency_config = latency_config or get_latency_config()
+    item["latency_location"] = latency_config["location"]
+    item["carrier_tests"] = []
+    for carrier in latency_config["carriers"]:
+        key = carrier["key"]
+        latency_value = metrics.get(f"{key}_latency_ms")
+        loss_value = metrics.get(f"{key}_loss_pct")
+        latency_value = round(float(latency_value), 1) if latency_value is not None else None
+        loss_value = round(float(loss_value), 1) if loss_value is not None else None
+        item["carrier_tests"].append({
+            "key": key,
+            "label": carrier["label"],
+            "target": carrier["target"],
+            "latency_ms": latency_value,
+            "loss_pct": loss_value,
+            "latency_quality_percent": (
+                max(3, min(100, round(100 - latency_value / 3, 1)))
+                if latency_value is not None else 0
+            ),
+            "loss_quality_percent": (
+                max(0, min(100, round(100 - loss_value, 1)))
+                if loss_value is not None else 0
+            ),
+        })
     return item
 
 
@@ -1851,7 +1987,8 @@ def logout():
 def dashboard():
     with db_connection() as conn:
         rows = conn.execute("SELECT * FROM vps ORDER BY expiry_date, name").fetchall()
-    servers = [serialize_vps(row) for row in rows]
+    latency_config = get_latency_config()
+    servers = [serialize_vps(row, latency_config) for row in rows]
     totals = {}
     for server in servers:
         currency = server.get("currency") or "CNY"
@@ -1867,7 +2004,9 @@ def dashboard():
         "due": sum(v["days_left"] is not None and v["days_left"] <= 3 for v in servers),
         "total_display": total_display,
     }
-    return render_template("dashboard.html", servers=servers, counts=counts)
+    return render_template(
+        "dashboard.html", servers=servers, counts=counts, latency_config=latency_config
+    )
 
 
 @app.get("/api/dashboard/live")
@@ -1877,10 +2016,11 @@ def dashboard_live():
     with db_connection() as conn:
         rows = conn.execute("SELECT * FROM vps ORDER BY id").fetchall()
     servers = []
+    latency_config = get_latency_config()
     live_network_count = 0
     live_network_target_count = 0
     for row in rows:
-        item = serialize_vps(row)
+        item = serialize_vps(row, latency_config)
         metrics = item.get("metrics") or {}
         has_ssh_credentials = bool(
             item.get("login_username") and item.get("login_password_encrypted")
@@ -1909,6 +2049,7 @@ def dashboard_live():
             "traffic_percent": item.get("traffic_percent", 0),
             "latency_ms": item.get("latency_ms"),
             "packet_loss_pct": item.get("packet_loss_pct"),
+            "carrier_tests": item.get("carrier_tests", []),
             "metrics": {
                 "cpu_percent": metrics.get("cpu_percent", 0),
                 "memory_percent": metrics.get("memory_percent", 0),
@@ -1929,6 +2070,7 @@ def dashboard_live():
         "browser_refresh_interval": LIVE_NETWORK_INTERVAL,
         "live_network_count": live_network_count,
         "live_network_target_count": live_network_target_count,
+        "latency_location": latency_config["location"],
         "servers": servers,
     }
 
@@ -2908,19 +3050,45 @@ def settings():
     if flask_request.method == "POST":
         token = flask_request.form.get("telegram_bot_token", "").strip()
         chat_id = flask_request.form.get("telegram_chat_id", "").strip()
+        updated = []
         if token:
             set_setting("telegram_bot_token", token)
+            updated.append("Telegram Token")
         if chat_id:
             set_setting("telegram_chat_id", chat_id)
-        if not token and not chat_id:
+            updated.append("Telegram Chat ID")
+
+        if "latency_location_name" in flask_request.form:
+            location = flask_request.form.get("latency_location_name", "").strip()
+            if not location or len(location) > 20:
+                flash("三网检测地点必须填写，且不能超过 20 个字符。", "error")
+                return redirect(url_for("settings"))
+            try:
+                targets = {
+                    key: normalize_latency_target(
+                        flask_request.form.get(f"latency_{key}_target", "")
+                    )
+                    for key, _label, _default in LATENCY_CARRIERS
+                }
+            except ValueError as exc:
+                flash(str(exc), "error")
+                return redirect(url_for("settings"))
+            set_setting("latency_location_name", location)
+            for key, value in targets.items():
+                set_setting(f"latency_{key}_target", value)
+            updated.append("三网延迟目标")
+
+        if not updated:
             flash("没有填写任何新内容。", "error")
         else:
-            flash("Telegram 设置已保存，请点击“发送测试消息”。", "success")
+            flash(f"已保存：{'、'.join(updated)}。三网数据会在下一轮采集时更新。", "success")
         return redirect(url_for("settings"))
+    latency_config = get_latency_config()
     return render_template(
         "settings.html",
         token_configured=bool(get_setting("telegram_bot_token", "TELEGRAM_BOT_TOKEN")),
         chat_id=get_setting("telegram_chat_id", "TELEGRAM_CHAT_ID"),
+        latency_config=latency_config,
     )
 
 

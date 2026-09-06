@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}面板设置 · VPS 监控中心{% endblock %}
+{% block content %}
+<style>
+  .settings-stack { display:grid; gap:22px; }
+  .settings-section { padding:20px; border:1px solid #e2e8f1; border-radius:15px; background:#f8fafc; }
+  .settings-section h2 { margin:0 0 7px; font-size:20px; }
+  .settings-section .section-help { margin:0 0 18px; color:#6f7d92; line-height:1.65; }
+  .settings-target-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; }
+  .settings-target-grid label { margin-top:0; }
+  .settings-note { margin:12px 0 0; color:#77849a; font-size:13px; line-height:1.65; }
+  @media (max-width:760px) { .settings-target-grid { grid-template-columns:1fr; } }
+</style>
+
+<section class="form-card card">
+  <div class="page-head">
+    <div>
+      <h1>面板设置</h1>
+      <p class="muted">三网测试地点和目标都能在这里修改，不需要改代码。</p>
+    </div>
+  </div>
+
+  <form method="post" class="server-form settings-stack">
+    <div class="settings-section">
+      <h2>三网延迟目标</h2>
+      <p class="section-help">由每台 VPS 主动连接下面三个目标，显示 TCP 建连延迟与三次探测的失败率。</p>
+
+      <label for="latency-location">显示地点</label>
+      <input id="latency-location" name="latency_location_name" maxlength="20"
+             value="{{ latency_config.location }}" placeholder="例如：浙江" required>
+
+      <div class="settings-target-grid">
+        {% for carrier in latency_config.carriers %}
+        <div>
+          <label for="latency-{{ carrier.key }}">{{ carrier.label }}目标</label>
+          <input id="latency-{{ carrier.key }}" name="latency_{{ carrier.key }}_target"
+                 value="{{ carrier.target }}" placeholder="域名或IPv4:端口" required>
+        </div>
+        {% endfor %}
+      </div>
+      <p class="settings-note">以后搬到其他省份时，只要改“显示地点”和三个目标即可。目标格式必须是“域名或 IPv4:端口”，例如 zj-cm-v4.ip.zstaticcdn.com:80。</p>
+    </div>
+
+    <div class="settings-section">
+      <h2>Telegram 通知</h2>
+      <p class="section-help">机器人 Token 只保存在这台小主机中，不会显示在页面上。</p>
+      <label>机器人 Token</label>
+      <input type="password" name="telegram_bot_token" autocomplete="off"
+             placeholder="{{ '已经配置；留空表示不修改' if token_configured else '粘贴 BotFather 给你的 Token' }}">
+      <label>Chat ID</label>
+      <input name="telegram_chat_id" value="{{ chat_id }}" placeholder="例如：123456789">
+    </div>
+
+    <div class="form-actions">
+      <button class="button primary" type="submit">保存设置</button>
+      <a class="button" href="{{ url_for('dashboard') }}">返回首页</a>
+    </div>
+  </form>
+
+  <hr class="divider">
+  <form method="post" action="{{ url_for('test_telegram') }}">
+    <button class="button" type="submit">发送 Telegram 测试消息</button>
+  </form>
+</section>
+{% endblock %}
